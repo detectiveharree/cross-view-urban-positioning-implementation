@@ -65,8 +65,8 @@ def compute_coverage(image_path, model, conf=0.2):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir",  default=None)
-    parser.add_argument("--dataset",   default="uk_dataset",
-                        choices=["uk_dataset", "gv_dataset"])
+    parser.add_argument("--dataset",   default="gv_dataset",
+                        choices=["gv_dataset", "uk_dataset"])
     parser.add_argument("--n-samples", type=int, default=None,
                         help="Limit number of images (random sample)")
     parser.add_argument("--city",      default=None)

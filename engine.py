@@ -39,8 +39,8 @@ class PositioningConfig:
 
     # Directories
     osm_tile_dir:    str = os.path.join(_DATA_ROOT, "osm_tiles")
-    gv_dataset_dir:  str = os.path.join(_DATA_ROOT, "uk_dataset")
-    metadata_file:   str = os.path.join(_DATA_ROOT, "uk_dataset", "metadata.json")
+    gv_dataset_dir:  str = os.path.join(_DATA_ROOT, "gv_dataset")
+    metadata_file:   str = os.path.join(_DATA_ROOT, "gv_dataset", "metadata.json")
     output_dir:      str = "results/positioning"
     runs_dir:        str = os.path.join(_REPO_ROOT, "..", "runs", "segment", "positioning_research")
     yolo_labels_dir: str = os.path.join(_DATA_ROOT, "yolo_dataset_v1", "labels")

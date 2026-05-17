@@ -104,8 +104,8 @@ def main():
     parser.add_argument("--city",      default=None,   help="Process one city only")
     parser.add_argument("--n-images",  type=int, default=None, help="Limit images processed")
     parser.add_argument("--data-dir",  default=None)
-    parser.add_argument("--dataset",   default="uk_dataset",
-                        choices=["uk_dataset", "gv_dataset"])
+    parser.add_argument("--dataset",   default="gv_dataset",
+                        choices=["gv_dataset", "uk_dataset"])
     args = parser.parse_args()
 
     _repo_root = os.path.dirname(os.path.abspath(__file__))
