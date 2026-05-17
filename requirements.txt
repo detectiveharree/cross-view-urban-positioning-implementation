@@ -1,0 +1,25 @@
+# Core ML
+torch>=2.0
+torchvision
+ultralytics>=8.0
+
+# CLIP for environment classification
+transformers>=4.36
+Pillow
+
+# Geo / OSM
+geopandas
+shapely
+pyproj
+osmnx
+
+# Data + viz
+numpy
+scipy
+pandas
+matplotlib
+opencv-python
+
+# API / utils
+requests
+python-dotenv
