@@ -2,8 +2,9 @@
 """
 run_positioning.py — Vectorised semantic ray-casting positioning experiment.
 
-Runs the cross-view positioning algorithm on a set of Mapillary images and
-produces accuracy metrics (top-N% inclusion rate, median error in metres).
+Runs the planarity+occlusion positioning variant with a known heading assumption
+on a set of Mapillary images and produces accuracy metrics (top-N% inclusion
+rate, median error in metres).
 
 Key metric — bracket percentile:
     For each image, the heatmap assigns a score to every candidate position.
@@ -12,14 +13,9 @@ Key metric — bracket percentile:
     Lower percentile = better. This is more meaningful than raw error because it
     accounts for the size of the search area.
 
-Heading modes (--windows controls which uncertainty levels to test):
-    known          — perfect heading from Mapillary compass_angle
-    window_Ndeg    — heading known to within ±N degrees (e.g. ±5, ±10, ±20, ±45)
-    free           — heading completely unknown, swept over 360°
-
 Usage examples:
     python run_positioning.py --n-samples 100
-    python run_positioning.py --n-samples 200 --windows 5 10 20 --city London
+    python run_positioning.py --n-samples 200 --city London
     python run_positioning.py --n-samples 50 --env-labels results/environment_labels.json
 """
 
@@ -55,10 +51,7 @@ from engine import (
 # CONSTANTS
 # ---------------------------------------------------------------------------
 
-DEFAULT_WINDOWS           = [5, 10, 20, 45]
-N_HEADING_CANDIDATES_WIN  = 9
-N_HEADING_CANDIDATES_FREE = 24
-MEM_LIMIT_BYTES           = 1 * 1024 ** 3   # 1 GB
+MEM_LIMIT_BYTES = 1 * 1024 ** 3   # 1 GB
 
 
 # ---------------------------------------------------------------------------
@@ -164,156 +157,6 @@ def compute_base_heatmap_fast(engine, grid, seg_query, heading, fov):
     return hm
 
 
-# ---------------------------------------------------------------------------
-# VECTORISED HEADING SWEEP
-# ---------------------------------------------------------------------------
-
-def compute_heatmap_heading_sweep_fast(engine, grid, seg_query, heading_candidates,
-                                       fov, column_depths, verbose_timing=False):
-    config     = engine.config
-    device     = engine.device
-    H, W       = grid.shape
-    n_headings = len(heading_candidates)
-    n_cols     = seg_query.shape[1]
-    n_steps    = int(80 / config.grid_res)
-
-    pad = int((config.tile_size - config.prior_size) / 2 / config.grid_res)
-    gy_eval, gx_eval, eval_idx = get_eval_coords(H, W, pad, config.prior_px, device)
-    n_eval = gy_eval.shape[0]
-
-    steps      = torch.arange(0, 80, config.grid_res, device=device).float() / config.grid_res
-    headings_t = torch.tensor(heading_candidates, device=device, dtype=torch.float32)
-
-    class_configs = [(1, 0.10, 1.0), (2, 0.10, 1.0), (3, 0.05, 2.0)]
-    class_pcts, active = {}, {}
-    for cv, thr, _ in class_configs:
-        pct  = (seg_query == cv).float().mean(dim=0)
-        mask = pct > thr
-        if mask.any():
-            class_pcts[cv] = pct
-            active[cv]     = mask
-
-    col_indices     = torch.arange(n_cols, device=device).float()
-    bearing_offsets = ((col_indices / n_cols) - 0.5) * fov
-    angles_all      = torch.deg2rad(headings_t.unsqueeze(1) + bearing_offsets.unsqueeze(0))
-    dx_all = torch.sin(angles_all)
-    dy_all = -torch.cos(angles_all)
-
-    hm_scores      = torch.zeros((n_eval, n_headings), device=device)
-    pos_batch_size = min(n_eval, 512)
-    col_chunk_size = max(1, min(n_cols, MEM_LIMIT_BYTES // max(pos_batch_size * n_headings * n_steps * 4 * 5, 1)))
-    t0 = time.time()
-
-    for col_start in range(0, n_cols, col_chunk_size):
-        col_end = min(col_start + col_chunk_size, n_cols)
-        n_c     = col_end - col_start
-        K       = n_headings * n_c
-        dx_flat = dx_all[:, col_start:col_end].reshape(K)
-        dy_flat = dy_all[:, col_start:col_end].reshape(K)
-
-        chunk_info = []
-        for cv, thr, rw in class_configs:
-            if cv not in active:
-                continue
-            ac = active[cv][col_start:col_end]
-            pc = class_pcts[cv][col_start:col_end]
-            if ac.any():
-                chunk_info.append((cv, rw * pc * ac.float()))
-        if not chunk_info:
-            continue
-
-        for i_start in range(0, n_eval, pos_batch_size):
-            i_end = min(i_start + pos_batch_size, n_eval)
-            B     = i_end - i_start
-            vals    = _grid_lookup(gy_eval[i_start:i_end], gx_eval[i_start:i_end],
-                                   dx_flat, dy_flat, steps, grid, H, W)
-            visible = _apply_occlusion(vals)
-            del vals
-            visible = visible.view(B, n_headings, n_c, n_steps)
-            for cv, wc in chunk_info:
-                hit     = (visible == cv).any(dim=3)
-                contrib = (hit * wc.view(1, 1, n_c)).sum(dim=2)
-                hm_scores[i_start:i_end] += contrib
-                del hit, contrib
-            del visible
-
-    # Depth modulator
-    has_depth = (column_depths is not None and (~np.isnan(column_depths)).sum() >= 5)
-    if has_depth:
-        valid_mask   = ~np.isnan(column_depths)
-        valid_cols   = np.where(valid_mask)[0]
-        n_valid      = len(valid_cols)
-        image_depths = column_depths[valid_cols]
-
-        MAX_DEPTH_COLS = 32
-        if n_valid > MAX_DEPTH_COLS:
-            idx          = np.round(np.linspace(0, n_valid-1, MAX_DEPTH_COLS)).astype(int)
-            valid_cols   = valid_cols[idx]
-            image_depths = image_depths[idx]
-            n_valid      = MAX_DEPTH_COLS
-
-        ii, jj       = np.triu_indices(n_valid, k=1)
-        pair_weights = np.abs(image_depths[ii] - image_depths[jj]).astype(np.float32)
-        max_gap      = pair_weights.max()
-
-        if max_gap < 1e-6 or len(ii) == 0:
-            hm_max_eval = hm_scores.max(dim=1)[0]
-        else:
-            pair_weights   /= max_gap
-            image_i_closer  = (image_depths[ii] < image_depths[jj])
-            pw_t   = torch.tensor(pair_weights,   device=device, dtype=torch.float32)
-            ic_t   = torch.tensor(image_i_closer, device=device, dtype=torch.float32)
-            ii_t   = torch.tensor(ii,             device=device, dtype=torch.long)
-            jj_t   = torch.tensor(jj,             device=device, dtype=torch.long)
-            sw     = pw_t.sum()
-
-            n_pairs = len(ii)
-            col_t_valid = torch.tensor(valid_cols, device=device).float()
-            bearing_v   = ((col_t_valid / n_cols) - 0.5) * fov
-            angles_v    = torch.deg2rad(headings_t.unsqueeze(1) + bearing_v.unsqueeze(0))
-            dx_v = torch.sin(angles_v).reshape(n_headings * n_valid)
-            dy_v = -torch.cos(angles_v).reshape(n_headings * n_valid)
-
-            bpp          = max(n_headings * n_valid * n_steps * 4 * 5, n_headings * n_pairs * 4)
-            depth_batch  = max(1, min(n_eval, MEM_LIMIT_BYTES // bpp))
-            depth_scores = torch.zeros((n_eval, n_headings), device=device)
-
-            for i_start in range(0, n_eval, depth_batch):
-                i_end = min(i_start + depth_batch, n_eval)
-                B     = i_end - i_start
-                vals        = _grid_lookup(gy_eval[i_start:i_end], gx_eval[i_start:i_end],
-                                           dx_v, dy_v, steps, grid, H, W)
-                is_building = (vals == 1)
-                first_hit   = is_building.float().argmax(dim=2)
-                has_hit     = is_building.any(dim=2)
-                del vals, is_building
-                map_dist = first_hit.float() * config.grid_res
-                map_dist[~has_hit] = 9999.0
-                del first_hit, has_hit
-                map_dist = map_dist.view(B, n_headings, n_valid)
-                dist_i   = map_dist[:, :, ii_t]
-                dist_j   = map_dist[:, :, jj_t]
-                mc       = (dist_i < dist_j).float()
-                del map_dist, dist_i, dist_j
-                agreement      = (mc == ic_t.view(1,1,-1)).float()
-                ws             = (agreement * pw_t.view(1,1,-1)).sum(dim=2) / sw
-                depth_scores[i_start:i_end] = 2.0 * ws - 1.0
-                del mc, agreement, ws
-
-            depth_scores = (depth_scores + 1.0) / 2.0
-            hm_max_eval  = (hm_scores * (1.0 + depth_scores)).max(dim=1)[0]
-            del depth_scores
-            if device == "cuda":
-                torch.cuda.empty_cache()
-    else:
-        hm_max_eval = hm_scores.max(dim=1)[0]
-
-    hm_full = torch.zeros((H, W), device=device)
-    hm_full.view(-1)[eval_idx] = hm_max_eval
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
-    return hm_full, time.time() - t0
 
 
 # ---------------------------------------------------------------------------
@@ -465,13 +308,6 @@ def get_valid_samples(config, city_filter=None, env_labels=None, env_filter=None
     return valid
 
 
-def build_heading_candidates(true_heading, window_deg, n_candidates):
-    if window_deg is None:
-        return np.linspace(0, 360, n_candidates, endpoint=False)
-    return np.linspace(true_heading - window_deg, true_heading + window_deg,
-                       n_candidates, endpoint=True)
-
-
 # ---------------------------------------------------------------------------
 # PROGRESS BAR
 # ---------------------------------------------------------------------------
@@ -504,23 +340,15 @@ class ProgressBar:
 # MAIN EXPERIMENT LOOP
 # ---------------------------------------------------------------------------
 
-def run_experiments(engine, samples, config, windows):
-    depth_regimes = [("known", None)]
-    for w in windows:
-        depth_regimes.append((f"window_{w}deg", float(w)))
-    depth_regimes.append(("free", None))
-
-    results = {
-        "planarity_occlusion": {"known": []},
-        "depth_weighted":      {name: [] for name, _ in depth_regimes},
-    }
+def run_experiments(engine, samples, config):
+    results = {"planarity_occlusion": {"known": []}}
 
     print(f"\n{'='*65}")
-    print(f"SEMANTIC RAY-CASTING POSITIONING")
-    print(f"  Samples: {len(samples)}  |  Windows: ±{windows}°")
+    print(f"SEMANTIC RAY-CASTING POSITIONING  (planarity+occlusion, known heading)")
+    print(f"  Samples: {len(samples)}")
     print(f"{'='*65}")
 
-    progress    = ProgressBar(len(samples), desc="Processing")
+    progress = ProgressBar(len(samples), desc="Processing")
     first_sample = True
 
     for sample in samples:
@@ -540,10 +368,10 @@ def run_experiments(engine, samples, config, windows):
             grid, (cx, cy), map_crs = engine.rasterize_vector_map(map_path, gps_lon, gps_lat)
 
             t_seg = time.time()
-            seg_query, _, _, _, column_depths, _ = engine.extract_query_features(
+            seg_query, _, _, _, _, _ = engine.extract_query_features(
                 img_path, fov,
                 focal_length=sample.get("camera_parameters", [0.5])[0],
-                compute_depth=True, compute_road_geometry=False,
+                compute_depth=False, compute_road_geometry=False,
             )
             seg_time = time.time() - t_seg
 
@@ -553,44 +381,13 @@ def run_experiments(engine, samples, config, windows):
             gt_y     = config.tile_px - ((ty - (cy - config.tile_size/2)) / config.grid_res)
             gt_pixel = (gt_x, gt_y)
 
-            has_depth = column_depths is not None and (~np.isnan(column_depths)).sum() >= 5
-
-            # Ablation: planarity+occlusion, known heading
             t0      = time.time()
-            hm_po   = compute_base_heatmap_fast(engine, grid, seg_query, true_heading, fov)
-            algo_po = time.time() - t0
+            hm      = compute_base_heatmap_fast(engine, grid, seg_query, true_heading, fov)
+            algo_t  = time.time() - t0
             results["planarity_occlusion"]["known"].append(
-                heatmap_to_result(hm_po, gt_pixel, config, img_id,
-                                  "planarity_occlusion", "known", seg_time, algo_po)
+                heatmap_to_result(hm, gt_pixel, config, img_id,
+                                  "planarity_occlusion", "known", seg_time, algo_t)
             )
-
-            # Depth-weighted: all heading regimes
-            for regime_name, window in depth_regimes:
-                if regime_name == "known":
-                    t0 = time.time()
-                    hm_b = compute_base_heatmap_fast(engine, grid, seg_query, true_heading, fov)
-                    if has_depth:
-                        hm_d = compute_weighted_depth_fast(engine, grid, true_heading, fov, column_depths)
-                        hm_f = hm_b * (1.0 + hm_d)
-                    else:
-                        hm_f = hm_b
-                    algo_time = time.time() - t0
-                else:
-                    n_cands    = (N_HEADING_CANDIDATES_FREE if regime_name == "free"
-                                  else N_HEADING_CANDIDATES_WIN)
-                    candidates = build_heading_candidates(
-                        true_heading,
-                        window_deg=None if regime_name == "free" else window,
-                        n_candidates=n_cands,
-                    )
-                    hm_f, algo_time = compute_heatmap_heading_sweep_fast(
-                        engine, grid, seg_query, candidates, fov, column_depths,
-                        verbose_timing=first_sample,
-                    )
-                results["depth_weighted"][regime_name].append(
-                    heatmap_to_result(hm_f, gt_pixel, config, img_id,
-                                      "depth_weighted", regime_name, seg_time, algo_time)
-                )
 
         except Exception as e:
             import traceback
@@ -607,80 +404,12 @@ def run_experiments(engine, samples, config, windows):
     return results
 
 
-def compute_weighted_depth_fast(engine, grid, heading, fov, column_depths):
-    """Single-heading depth modulator (used for 'known' regime)."""
-    config = engine.config
-    device = engine.device
-    H, W   = grid.shape
-    hm_depth = torch.zeros((H, W), device=device)
-
-    valid_mask   = ~np.isnan(column_depths)
-    valid_cols   = np.where(valid_mask)[0]
-    n_valid      = len(valid_cols)
-    if n_valid < 5:
-        return hm_depth
-
-    image_depths = column_depths[valid_cols]
-    ii, jj       = np.triu_indices(n_valid, k=1)
-    pair_weights = np.abs(image_depths[ii] - image_depths[jj]).astype(np.float32)
-    max_gap      = pair_weights.max()
-    if max_gap < 1e-6:
-        return hm_depth
-
-    pair_weights   /= max_gap
-    image_i_closer  = (image_depths[ii] < image_depths[jj])
-    pw_t = torch.tensor(pair_weights,   device=device, dtype=torch.float32)
-    ic_t = torch.tensor(image_i_closer, device=device, dtype=torch.float32)
-    ii_t = torch.tensor(ii,             device=device, dtype=torch.long)
-    jj_t = torch.tensor(jj,             device=device, dtype=torch.long)
-    sw   = pw_t.sum()
-
-    pad   = int((config.tile_size - config.prior_size) / 2 / config.grid_res)
-    steps = torch.arange(0, 80, config.grid_res, device=device).float() / config.grid_res
-    gy_eval, gx_eval, eval_idx = get_eval_coords(H, W, pad, config.prior_px, device)
-    n_eval  = gy_eval.shape[0]
-    col_t   = torch.tensor(valid_cols, device=device)
-    dx, dy  = _ray_directions(col_t, 160, heading, fov, device)
-
-    n_steps        = int(80 / config.grid_res)
-    bytes_per_pos  = max(n_valid * n_steps * 4 * 5, len(ii) * 4)
-    pos_batch_size = max(1, min(n_eval, MEM_LIMIT_BYTES // bytes_per_pos))
-
-    for i_start in range(0, n_eval, pos_batch_size):
-        i_end = min(i_start + pos_batch_size, n_eval)
-        b_idx = eval_idx[i_start:i_end]
-        vals        = _grid_lookup(gy_eval[i_start:i_end], gx_eval[i_start:i_end],
-                                   dx, dy, steps, grid, H, W)
-        is_building = (vals == 1)
-        first_hit   = is_building.float().argmax(dim=2)
-        has_hit     = is_building.any(dim=2)
-        del vals, is_building
-        map_dist = first_hit.float() * config.grid_res
-        map_dist[~has_hit] = 9999.0
-        del first_hit, has_hit
-        dist_i = map_dist[:, ii_t]
-        dist_j = map_dist[:, jj_t]
-        mc     = (dist_i < dist_j).float()
-        del map_dist, dist_i, dist_j
-        agreement = (mc == ic_t.unsqueeze(0)).float()
-        ws        = (agreement * pw_t.unsqueeze(0)).sum(dim=1) / sw
-        hm_depth.view(-1)[b_idx] = 2.0 * ws - 1.0
-        del mc, agreement, ws
-
-    hm_depth = (hm_depth + 1.0) / 2.0
-    if device == "cuda":
-        torch.cuda.empty_cache()
-    return hm_depth
-
-
 # ---------------------------------------------------------------------------
 # ARGUMENT PARSING + MAIN
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Semantic ray-casting positioning experiment")
-    p.add_argument("--windows",    type=int, nargs="+", default=DEFAULT_WINDOWS,
-                   help="Heading uncertainty windows in degrees (default: 5 10 20 45)")
+    p = argparse.ArgumentParser(description="Semantic ray-casting positioning (planarity+occlusion, known heading)")
     p.add_argument("--n-samples",  type=int, default=200)
     p.add_argument("--seed",       type=int, default=42)
     p.add_argument("--city",       type=str, default=None,
@@ -724,43 +453,33 @@ def main():
             env_labels = json.load(f)
         print(f"  Environment labels loaded: {len(env_labels)} images")
 
-    engine        = PositioningEngine(model_path, config, load_depth_model=True)
+    engine        = PositioningEngine(model_path, config, load_depth_model=False)
     valid_samples = get_valid_samples(config, city_filter=args.city,
                                       env_labels=env_labels, env_filter=args.env_filter)
     n             = min(args.n_samples, len(valid_samples))
     test_samples  = random.sample(valid_samples, n)
     print(f"\nSelected {n} samples\n")
 
-    all_results = run_experiments(engine, test_samples, config, args.windows)
+    all_results = run_experiments(engine, test_samples, config)
 
     po_metrics = {"planarity_occlusion (known)":
                   compute_metrics(all_results["planarity_occlusion"]["known"])}
-    print_results_table(po_metrics, "ABLATION — PLANARITY+OCCLUSION, KNOWN HEADING")
-
-    dw_metrics = {r: compute_metrics(res) for r, res in all_results["depth_weighted"].items()}
-    print_results_table(dw_metrics, "DEPTH WEIGHTED — HEADING UNCERTAINTY SWEEP")
+    print_results_table(po_metrics, "PLANARITY+OCCLUSION — KNOWN HEADING")
 
     # Save JSON results
-    metrics_out = {
-        "planarity_occlusion": {"known": po_metrics["planarity_occlusion (known)"]},
-        "depth_weighted":      dw_metrics,
-    }
+    metrics_out = {"planarity_occlusion": {"known": po_metrics["planarity_occlusion (known)"]}}
     with open(os.path.join(config.output_dir, "metrics.json"), "w") as f:
         json.dump(metrics_out, f, indent=2)
 
-    detail_out = {}
-    for mode, regimes in all_results.items():
-        detail_out[mode] = {}
-        for regime, res_list in regimes.items():
-            detail_out[mode][regime] = [
-                {"image_id":           r.image_id,
-                 "bracket_percentile": r.bracket_percentile,
-                 "error_m":            r.error_m,
-                 "seg_time_s":         r.seg_time,
-                 "algo_time_s":        r.algo_time,
-                 "total_time_s":       r.total_time}
-                for r in res_list
-            ]
+    detail_out = {"planarity_occlusion": {"known": [
+        {"image_id":           r.image_id,
+         "bracket_percentile": r.bracket_percentile,
+         "error_m":            r.error_m,
+         "seg_time_s":         r.seg_time,
+         "algo_time_s":        r.algo_time,
+         "total_time_s":       r.total_time}
+        for r in all_results["planarity_occlusion"]["known"]
+    ]}}
     with open(os.path.join(config.output_dir, "results_detail.json"), "w") as f:
         json.dump(detail_out, f, indent=2)
 
